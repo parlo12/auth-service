@@ -77,16 +77,21 @@ func main() {
 		port = "8082"
 	}
 	log.Printf("Auth service is listening on port %s", port)
+
+	for _, r := range router.Routes() {
+		log.Printf("→ %s %s", r.Method, r.Path)
+	}
+
 	router.Run(":" + port)
 }
 
 func setupDatabase() {
 	// Get database configuration from environment variables or use defaults
-	dbHost := getEnv("DB_HOST", "postgres")
-	dbUser := getEnv("DB_USER", "rolf")
-	dbPassword := getEnv("DB_PASSWORD", "newpassword")
-	dbName := getEnv("DB_NAME", "streaming_db")
-	dbPort := getEnv("DB_PORT", "5432")
+	dbHost := getEnv("DB_HOST", "")
+	dbUser := getEnv("DB_USER", "")
+	dbPassword := getEnv("DB_PASSWORD", "")
+	dbName := getEnv("DB_NAME", "")
+	dbPort := getEnv("DB_PORT", "")
 
 	// DSN for PostgreSQL connection
 	dsn := "host=" + dbHost +
