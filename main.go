@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +15,11 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	"github.com/stripe/stripe-go/v78"
+	"github.com/stripe/stripe-go/v78/checkout/session"
+	"github.com/stripe/stripe-go/v78/customer"
+	"github.com/stripe/stripe-go/v78/webhook"
 )
 
 // Global variables
@@ -69,7 +76,12 @@ func main() {
 	authorized.Use(authMiddleware())
 	{
 		authorized.GET("/profile", profileHandler)
+		// adding stripe checkout session
+		authorized.POST("/stripe/create-checkout-session", createCheckoutSessionHandler)
+		authorized.GET("/account-type", getAccountTypeHandler)
 	}
+
+	router.POST("/stripe/webhook", stripeWebhookHandler)
 
 	// Use port from env or default to 8082
 	port := os.Getenv("PORT")
@@ -190,6 +202,159 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"token": tokenString})
+}
+
+// Stripe handler function
+func createCheckoutSessionHandler(c *gin.Context) {
+	// 1. Get user ID from token
+	claims, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	userClaims := claims.(jwt.MapClaims)
+	userID := uint(userClaims["user_id"].(float64))
+
+	// 2. Lookup user from DB
+	var user User
+	if err := db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
+		return
+	}
+
+	// 3. Set Stripe API key
+	stripe.Key = getEnv("STRIPE_SECRET_KEY", "")
+
+	// 4. Create Stripe customer if not exists
+	var customerID string
+	if user.StripeCustomerID != "" {
+		customerID = user.StripeCustomerID
+	} else {
+		params := &stripe.CustomerParams{
+			Email: stripe.String(user.Email),
+		}
+		cus, err := customer.New(params)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create Stripe customer"})
+			return
+		}
+		customerID = cus.ID
+		user.StripeCustomerID = customerID
+		db.Save(&user) // Save to DB
+	}
+
+	// 5. Create Stripe Checkout session
+	params := &stripe.CheckoutSessionParams{
+		Customer:           stripe.String(customerID),
+		PaymentMethodTypes: stripe.StringSlice([]string{"card"}),
+		Mode:               stripe.String(string(stripe.CheckoutSessionModeSubscription)),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				Price:    stripe.String("price_1Rq20XChBqCooXQK4rkn86Vr"), // 🔁 Replace with your Stripe Price ID
+				Quantity: stripe.Int64(1),
+			},
+			{
+				Price:    stripe.String("price_1Rq1zUChBqCooXQK1QsUsfFr"),
+				Quantity: stripe.Int64(1),
+			},
+		},
+		SuccessURL: stripe.String("https://content-service-9ncuf.ondigitalocean.app/thank-you-page"),
+		CancelURL:  stripe.String("https://content-service-9ncuf.ondigitalocean.app/cancel"),
+	}
+	s, err := session.New(params)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create Stripe Checkout session", "details": err.Error()})
+		return
+	}
+
+	// 6. Return checkout URL
+	c.JSON(http.StatusOK, gin.H{"url": s.URL})
+}
+
+//adding stripe webhookhandler
+
+func stripeWebhookHandler(c *gin.Context) {
+	const MaxBodyBytes = int64(65536)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxBodyBytes)
+
+	payload, err := ioutil.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Error reading request body"})
+		return
+	}
+
+	endpointSecret := getEnv("STRIPE_WEBHOOK_SECRET", "")
+	sigHeader := c.GetHeader("Stripe-Signature")
+	event, err := webhook.ConstructEvent(payload, sigHeader, endpointSecret)
+
+	if err != nil {
+		log.Printf("⚠️ Webhook signature verification failed: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Signature verification failded"})
+		return
+	}
+
+	switch event.Type {
+
+	case "checkout.session.completed":
+		var session stripe.CheckoutSession
+		if err := json.Unmarshal(event.Data.Raw, &session); err != nil {
+			log.Printf("⚠️ Failed to parse session: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse session"})
+			return
+		}
+		customerID := session.Customer.ID
+		updateUserAccountType(customerID, "paid")
+
+	case "customer.subscription.deleted":
+		var sub stripe.Subscription
+		if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
+			log.Printf("⚠️ Failed to parse subscription deletion: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse subscription"})
+			return
+		}
+		customerID := sub.Customer.ID
+		updateUserAccountType(customerID, "free")
+
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "received"})
+}
+
+// update account Type function
+
+func updateUserAccountType(customerID, newType string) {
+	var user User
+	if err := db.Where("stripe_customer_id = ?", customerID).First(&user).Error; err != nil {
+		log.Printf("❌ No user found for stripe customer ID: %s", customerID)
+		return
+	}
+
+	user.AccountType = newType
+	if err := db.Save(&user).Error; err != nil {
+		log.Printf("❌ Failed to update user %d account type to %s: %v", user.ID, newType, err)
+		return
+	}
+	log.Printf("✅ User %s account update to %s", user.Email, newType)
+}
+
+func getAccountTypeHandler(c *gin.Context) {
+	claims, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing claims"})
+		return
+	}
+	userClaims := claims.(jwt.MapClaims)
+	userID := uint(userClaims["user_id"].(float64))
+
+	var user User
+	if err := db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"account_type": user.AccountType,
+	})
 }
 
 // profileHandler returns user profile info by querying the database using claims from the token
